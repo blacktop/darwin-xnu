@@ -15,7 +15,10 @@ jobs:
       - name: Install GitHub CLI
         run: |
           brew update
-          brew install gh
+          brew install robotsandpencils/made/xcodes
+      - name: Install XCode
+        run: |
+          xcodes install --latest
       - name: Build xnu
         run: |
           make -f Makefile.xnudeps
