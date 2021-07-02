@@ -8,13 +8,14 @@ on:
 
 jobs:
   build:
-    runs-on: macos-11.0
+    runs-on: macos-latest
     steps:
       - name: Check out repository code
         uses: actions/checkout@v2
       - name: Install GitHub CLI
         run: |
           brew update
+          brew install aria2
           brew install robotsandpencils/made/xcodes
       - name: Install XCode
         run: |
