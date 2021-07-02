@@ -1,0 +1,604 @@
+# -*- mode: makefile;-*-
+#
+# Apple XNU build prep
+# Jeremy C. Andrus
+#
+# This Makefile contains commands necessary to download
+# and build the XNU kernel for macOS High Sierra through
+# Big Sur. It will not actually build XNU, but it will
+# build and install all of the prerequisites.
+#
+
+macos_version ?= 11.4
+
+PKGS = dtrace AvailabilityVersions libdispatch xnu Libsystem
+ifeq ($(findstring 10.1,$(macos_version)),10.1)
+PKGS += libplatform
+endif
+
+default: xnudeps
+xnudeps: xnu
+xnu: check_tools
+
+check_tools: TOOLS = xcrun xcodebuild clang
+check_tools:
+	$(foreach tool,$(TOOLS),$(if $(shell which $(tool)),,$(error Missing '$(tool)': you can download Xcode here: https://developer.apple.com/xcode/)))
+
+APPLEOPENSOURCE = https://opensource.apple.com
+TARBALL_URL = $(APPLEOPENSOURCE)/tarballs
+RELEASE_URL = $(APPLEOPENSOURCE)/release/macos-$(subst .,,$(macos_version)).html
+
+TOOLCHAIN_PATH=$(shell cd `xcrun -sdk macosx -show-sdk-platform-path`/../../Toolchains/XcodeDefault.xctoolchain && pwd)
+SDKPATH=$(shell xcrun -sdk macosx -show-sdk-path)
+XCODEPATH=$(shell xcrun -sdk macosx -show-sdk-path | sed 's,\(.*/Xcode[^/]*\.app\)/.*,\1,')
+
+ifeq ($(findstring 10.13,$(macos_version)),10.13)
+dtrace: dtrace-pre10.15
+else ifeq ($(findstring 10.14,$(macos_version)),10.14)
+dtrace: dtrace-pre10.15
+else ifeq ($(findstring 10.1,$(macos_version)),10.1)
+dtrace: dtrace-10.15
+else
+dtrace: dtrace-11.x
+endif
+
+.SECONDEXPANSION:
+dtrace-pre10.15: $$(dtrace_src)/.src
+
+.SECONDEXPANSION:
+dtrace-10.15: $$(dtrace_src)/.src
+
+.SECONDEXPANSION:
+dtrace-11.x: $$(dtrace_src)/.src
+
+dtrace-11.x:
+	@echo "[INFO] Building ctf tools from dtrace..."
+	@$(HELP) cd "$(SRCDIR)" && $(HELP) xcodebuild install -sdk macosx -target ctfconvert \
+		-target ctfdump -target ctfmerge ARCHS='x86_64 arm64' VALID_ARCHS='x86_64 arm64' DSTROOT="$(SRCDIR)/dst"
+	$(HELP) sudo ditto "$(SRCDIR)/dst/$(TOOLCHAIN_PATH)" "$(TOOLCHAIN_PATH)"
+
+dtrace-10.15:
+	@echo "[INFO] Building ctf tools from dtrace..."
+	@$(HELP) mkdir -p "$(SRCDIR)/obj" "$(SRCDIR)/sym" "$(SRCDIR)/dst"
+	@$(HELP) echo "#include <stdint.h>" > $(SRCDIR)/include/llvm-Support/DataTypes.h && \
+		$(HELP) sed -i -e 's,include "llvm/Support/DataTypes,include "llvm-Support/DataTypes,' $(SRCDIR)/include/llvm-Support/PointerLikeTypeTraits.h
+	@$(HELP) cd "$(SRCDIR)" && $(HELP) xcodebuild install -sdk macosx \
+		-target ctfconvert -target ctfdump -target ctfmerge ARCHS="x86_64" VALID_ARCHS="x86_64" \
+		SRCROOT="$(SRCDIR)" OBJROOT="$(SRCDIR)/obj" SYMROOT="$(SRCDIR)/sym" DSTROOT="$(SRCDIR)/dst"
+	$(HELP) sudo ditto "$(SRCDIR)/dst/$(TOOLCHAIN_PATH)" "$(TOOLCHAIN_PATH)"
+
+dtrace-pre10.15:
+	@echo "[INFO] Building ctf tools from dtrace..."
+	@$(HELP) mkdir -p "$(SRCDIR)/obj" "$(SRCDIR)/sym" "$(SRCDIR)/dst"
+	@$(HELP) cd "$(SRCDIR)" && $(HELP) xcodebuild install -sdk macosx \
+		-target ctfconvert -target ctfdump -target ctfmerge ARCHS="x86_64" VALID_ARCHS="x86_64" \
+		SRCROOT="$(SRCDIR)" OBJROOT="$(SRCDIR)/obj" SYMROOT="$(SRCDIR)/sym" DSTROOT="$(SRCDIR)/dst" \
+		HEADER_SEARCH_PATHS="$(SRCDIR)/compat/opensolaris/** $(SRCDIR)/lib/**"
+	$(HELP) sudo ditto "$(SRCDIR)/dst/$(XCODEPATH)/Contents/Developer/Toolchains/XcodeDefault.xctoolchain" "$(TOOLCHAIN_PATH)"
+
+AvailabilityVersions:
+	@echo "[INFO] Installing AvailabilityVersions content..."
+	@$(HELP) mkdir -p "$(SRCDIR)/dst"
+	@$(HELP) rm -rf "$(SRCDIR)/dst/"*
+	@$(HELP) make -C "$(SRCDIR)" install SRCROOT="$(SRCDIR)" DSTROOT="$(SRCDIR)/dst"
+	$(HELP) sudo ditto "$(SRCDIR)/dst/usr/local/libexec" "$(SDKPATH)/usr/local/libexec"
+
+libplatform: INTPATH = usr/local/include/os/internal
+libplatform:
+	@echo "[INFO] Installing libplatform headers to SDK..."
+	$(HELP) sudo mkdir -p "$(SDKPATH)/$(INTPATH)"
+	$(HELP) sudo ditto "$(SRCDIR)/private/os/internal" "$(SDKPATH)/$(INTPATH)"
+
+ifeq ($(findstring 10.14,$(macos_version)),10.14)
+libdispatch: libdispatch-1014
+libdispatch: ARCHS=x86_64
+else ifeq ($(findstring 10.15,$(macos_version)),10.15)
+libdispatch: libdispatch-1015
+libdispatch: ARCHS=x86_64
+else
+libdispatch: libdispatch-11.x
+libdispatch: ARCHS=x86_64 arm64e
+endif
+
+.SECONDEXPANSION:
+libdispatch: $$(xnu_src)/.src
+
+.SECONDEXPANSION:
+libdispatch-1014: $$(libdispatch_src)/.src
+
+.SECONDEXPANSION:
+libdispatch-1015: $$(libdispatch_src)/.src
+
+.SECONDEXPANSION:
+libdispatch-11.x: $$(libdispatch_src)/.src
+
+libdispatch-11.x: xnu-installhdrs
+	@echo "[INFO] Building libfirehose_kernel.a from libdispatch..."
+	# next we need to install the firehose headers for the kernel
+	@$(HELP) cd $(SRCDIR) && $(HELP) xcodebuild install -sdk macosx -target libfirehose_kernel PRODUCT_NAME=firehose_kernel ARCHS='$(ARCHS)' VALID_ARCHS='$(ARCHS)' SRCROOT="$(SRCDIR)" OBJROOT="$(SRCDIR)/obj" SYMROOT="$(SRCDIR)/sym" DSTROOT="$(SRCDIR)/dst"
+	$(HELP) sudo ditto "$(SRCDIR)/dst/usr/local" "$(SDKPATH)/usr/local"
+
+libdispatch-1015: XCCONF_D = xcodeconfig/libdispatch.xcconfig
+libdispatch-1015: libplatform
+	@echo "[INFO] Building libfirehose_kernrel.a from libdispatch (10.15.x)..."
+	# Cleanup a bit of cruft in the 10.15.x open source drop
+	@$(HELP) awk '/include "<DEVELOPER/ { next; } /SDKROOT =/ { print "SDKROOT = macosx"; next; } { print $0 }' "$(libdispatch_path)/$(XCCONF_D)" > "$(libdispatch_path)/.__tmp__" \
+		&& $(HELP) mv -f "$(libdispatch_path)/.__tmp__" "$(libdispatch_path)/$(XCCONF_D)"
+	@$(HELP) mkdir -p "$(libdispatch_path)/obj" "$(libdispatch_path)/sym" "$(libdispatch_path)/dst"
+	@$(HELP) cd $(libdispatch_path) && $(HELP) xcodebuild install -sdk macosx -target libfirehose_kernel \
+		SRCROOT="$(libdispatch_path)" OBJROOT="$(libdispatch_path)/obj" \
+		SYMROOT="$(libdispatch_path)/sym" DSTROOT="$(libdispatch_path)/dst"
+	$(HELP) sudo ditto "$(libdispatch_path)/dst/usr/local" "$(libdispatch_path)/usr/local"
+
+libdispatch-1014: XCCONF_D = xcodeconfig/libdispatch.xcconfig
+libdispatch-1014: XCCONF_FH = xcodeconfig/libfirehose_kernel.xcconfig
+libdispatch-1014: libplatform
+	@echo "[INFO] Building libfirehose_kernel.a from libdispatch (10.14.x)..."
+	# Cleanup a bit of cruft in the 10.14.x open source drop
+	@$(HELP) awk '/include "<DEVELOPER/ { next; } /SDKROOT =/ { print "SDKROOT = macosx"; next; } { print $0 }' "$(libdispatch_path)/$(XCCONF_D)" > "$(libdispatch_path)/.__tmp__" \
+		&& $(HELP) mv -f "$(libdispatch_path)/.__tmp__" "$(libdispatch_path)/$(XCCONF_D)"
+	@$(HELP) awk '/#include / { next; } { print $0 }' "$(libdispatch_path)/$(XCCONF_FH)" > "$(libdispatch_path)/.__tmp__" \
+		&& $(HELP) mv -f "$(libdispatch_path)/.__tmp__" "$(libdispatch_path)/$(XCCONF_FH)"
+	@$(HELP) mkdir -p "$(libdispatch_path)/obj" "$(libdispatch_path)/sym" "$(libdispatch_path)/dst"
+	@$(HELP) cd $(libdispatch_path) && $(HELP) xcodebuild install -sdk macosx -target libfirehose_kernel \
+		SRCROOT="$(libdispatch_path)" OBJROOT="$(libdispatch_path)/obj" \
+		SYMROOT="$(libdispatch_path)/sym" DSTROOT="$(libdispatch_path)/dst"
+
+ifeq ($(findstring 11.,$(macos_version)),11.)
+xnu-installhdrs: ARCHS=X86_64 ARM64
+else
+xnu-installhdrs: libplatform
+xnu-installhdrs: ARCHS=X86_64
+endif
+
+xnu-installhdrs: dtrace AvailabilityVersions
+	@echo "[INFO] Installing XNU headers into the SDK..."
+	@$(HELP) cd "$(xnu_path)" && $(HELP) make XNU_LOGCOLORS=y SDKROOT=macosx ARCH_CONFIGS="$(ARCHS)" installhdrs
+	$(HELP) sudo ditto "$(xnu_path)/BUILD/dst" "$(SDKPATH)"
+
+.SECONDEXPANSION:
+xnu-installhdrs: $$(xnu_src)/.src
+
+ifeq ($(findstring 10.15,$(macos_version)),10.15)
+xnu: xnu-fixups
+else ifeq ($(findstring 10.14,$(macos_version)),10.14)
+xnu: xnu-fixups
+else ifeq ($(findstring 10.13,$(macos_version)),10.13)
+xnu: xnu-fixups
+endif
+
+xnu: dtrace AvailabilityVersions libdispatch xnu-fixups
+	@echo
+	@echo "--------------------------------------------------------------------------------"
+	@echo "XNU is now ready to build!"
+	@echo
+	@echo "To build the kernel for supported x86_64 machines:"
+	@echo "cd $(xnu_src)"
+	@echo "make SDKROOT=macosx TARGET_CONFIGS=\"RELEASE X86_64 NONE\""
+ifeq ($(findstring 11.,$(macos_version)),11.)
+ifneq ($(findstring 11.0,$(macos_version)),11.0)
+ifneq ($(findstring 11.1,$(macos_version)),11.1)
+	@echo
+	@echo "To build for supported arm64e machines you can, e.g.:"
+	@echo "cd $(xnu_src)"
+	@echo "make SDKROOT=macosx KDKROOT=/path/to/KDK TARGET_CONFIGS=\"RELEASE ARM64 T8101\""
+	@echo
+	@echo "For a table of supported arm64 products, visit:"
+	@echo "https://kernelshaman.blogspot.com/2021/02/building-xnu-for-macos-112-intel-apple.html#xnu-arm64e"
+endif
+endif
+endif
+	@echo
+	@echo "See xnu's top-level README file for additional build and configuration variables"
+	@echo "which can be passed on the command line, e.g.,"
+	@echo "  Speed up the build with: BUILD_LTO=0"
+	@echo "  Build the development kernel with: KERNEL_CONFIGS=DEVELOPMENT"
+	@echo
+	@echo "Use LOGCOLORS=y to colorize the output"
+	@echo "Use CONCISE=y to keep all the build output on a single line"
+	@echo "--------------------------------------------------------------------------------"
+	@echo
+
+# --------------------------------------------------
+#
+# macOS version-specific source fixups necessary to compile and link a kernel
+#
+# --------------------------------------------------
+#
+.PHONY: xnu-fixups
+xnu-fixups:
+	@echo
+
+ifeq ($(findstring 10.13,$(macos_version)),10.13)
+xnu-fixups: xnu-fixups-10.13
+else ifeq ($(findstring 10.14,$(macos_version)),10.14)
+xnu-fixups: xnu-fixups-10.14.1
+else ifeq ($(findstring 10.15.6,$(macos_version)),10.15.6)
+xnu-fixups: xnu-fixups-10.15.6
+else ifeq ($(findstring 10.15.5,$(macos_version)),10.15.5)
+xnu-fixups: xnu-fixups-10.15.4
+else ifeq ($(findstring 10.15.4,$(macos_version)),10.15.4)
+xnu-fixups: xnu-fixups-10.15.4
+else ifeq ($(findstring 10.15.3,$(macos_version)),10.15.3)
+xnu-fixups: xnu-fixups-10.15.3
+else ifeq ($(findstring 10.15,$(macos_version)),10.15)
+xnu-fixups: xnu-fixups-10.15
+endif
+.SECONDEXPANSION:
+xnu-fixups: $$(xnu_src)/.src
+
+.SECONDEXPANSION:
+xnu-fixups-10.13: $$(xnu_src)/.src
+
+xnu-fixups-10.13:
+	# Fixup KASAN build on 10.13.x
+	@$(HELP) touch "$(xnu_src)/san/kasan-blacklist-dynamic"
+
+.SECONDEXPANSION:
+xnu-fixups-10.14.1: $$(xnu_src)/.src
+
+xnu-fixups-10.14.1:
+	# Fixup 10.14.1 build
+	@echo "[FIXUP] IOPerfControl..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__1" ]; then \
+		$(HELP) echo "iokit/Kernel/IOPerfControl.cpp optional iokitcpp" >> "$(xnu_src)/iokit/conf/files"; \
+		$(HELP) touch "$(xnu_src)/.$@__1"; \
+	fi
+	@echo "[FIXUP] mach_bridge_remote_time..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__2" ]; then \
+		$(HELP) echo "uint64_t mach_bridge_remote_time(uint64_t a); uint64_t mach_bridge_remote_time(uint64_t a) { (void)a; return 0; }" >> "$(xnu_src)/osfmk/kern/timer.c"; \
+		$(HELP) echo "void mach_bridge_register_regwrite_timestamp_callback(void (*func)(uint64_t)); void mach_bridge_register_regwrite_timestamp_callback(void (*func)(uint64_t)) { (void)func; return; }" >> "$(xnu_src)/osfmk/kern/timer.c"; \
+		$(HELP) touch "$(xnu_src)/.$@__2"; \
+	fi
+	@echo "[FIXUP] networking (1/3)..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__3" ]; then \
+		$(HELP) echo "__attribute__((noreturn)) int network__stub__(void);" >> "$(xnu_src)/bsd/kern/kern_xxx.c"; \
+		$(HELP) echo "int network__stub__(void) { panic(\"unimplemented network stub\"); __builtin_unreachable(); }" >> "$(xnu_src)/bsd/kern/kern_xxx.c"; \
+		$(HELP) echo "__attribute__((noreturn)) int network__stub1__(void);" >> "$(xnu_src)/bsd/kern/kern_xxx.c"; \
+		$(HELP) echo "int network__stub1__(void) { panic(\"unimplemented network stub\"); __builtin_unreachable(); }" >> "$(xnu_src)/bsd/kern/kern_xxx.c"; \
+		$(HELP) touch "$(xnu_src)/.$@__3"; \
+	fi
+	@echo "[FIXUP] networking (2/3)..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__4" ]; then \
+		$(HELP) echo "const OSSymbol *IOSKCopyKextIdentifierWithAddress(vm_address_t a);" >> "$(xnu_src)/iokit/Kernel/IOWorkLoop.cpp"; \
+		$(HELP) echo "const OSSymbol *IOSKCopyKextIdentifierWithAddress(vm_address_t a) { OSKext *k = OSKext::lookupKextWithAddress(a); if (k) { const OSSymbol *s = k->getIdentifier(); k->release(); if (s) { s->retain(); return s; } } return NULL; }" >> "$(xnu_src)/iokit/Kernel/IOWorkLoop.cpp"; \
+		$(HELP) touch "$(xnu_src)/.$@__4"; \
+	fi
+	@echo "[FIXUP] networking (3/3)..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__5" ]; then \
+		$(HELP) echo "_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "__Z33IOSKCopyKextIdentifierWithAddressm" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_buflet_get_data_length:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_buflet_get_data_limit:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_buflet_get_data_offset:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_buflet_get_object_address:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_buflet_get_object_offset:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_buflet_get_object_segment:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_buflet_set_data_length:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_buflet_set_data_offset:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_advance_slot:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_available_slot_count:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_get_context:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_get_next_slot:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_get_service_class:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_increment_ring_net_stats:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_increment_ring_stats:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_notify:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_reclaim:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_ring_get_container:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_ring_get_context:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_slot_attach_packet:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_slot_detach_packet:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_slot_get_context:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_slot_get_packet:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_channel_tx_refill:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_copy_and_inet_checksum:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_inet_checksum:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_attr_clone:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_attr_create:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_attr_destroy:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_attr_get:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_attr_set:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_controller_alloc_net_provider_instance:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_controller_alloc_provider_instance:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_controller_bind_provider_instance:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_controller_create:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_controller_deregister_provider:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_controller_destroy:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_controller_free_provider_instance:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_controller_read_provider_attr:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_controller_register_provider:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_controller_unbind_provider_instance:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_deregister_domain_provider:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_get_builtin_domain_provider:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_get_context:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_get_pbufpool:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_nexus_register_domain_provider:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_clear_flow_uuid:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_finalize:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_buflet_count:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_data_length:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_euuid:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_flow_uuid:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_inet_checksum:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_link_broadcast:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_link_ethfcs:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_link_header_offset:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_link_multicast:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_network_header_offset:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_next_buflet:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_object_index:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_policy_id:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_service_class:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_service_class_index:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_timestamp:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_timestamp_requested:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_traffic_class:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_transport_header_offset:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_transport_last_packet:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_transport_new_flow:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_transport_retransmit:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_transport_traffic_background:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_transport_traffic_realtime:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_get_tx_completion_status:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_flow_uuid:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_inet_checksum:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_link_broadcast:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_link_ethfcs:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_link_header_offset:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_link_multicast:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_network_header_offset:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_policy_id:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_service_class:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_timestamp:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_traffic_class:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_transport_header_offset:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_set_tx_completion_status:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_packet_tx_completion:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_pbufpool_alloc:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_pbufpool_alloc_batch:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_pbufpool_alloc_batch_nosleep:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_pbufpool_alloc_nosleep:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_pbufpool_create:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_pbufpool_destroy:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_pbufpool_free:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_pbufpool_free_batch:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_pbufpool_get_context:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_pbufpool_get_memory_info:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_kern_segment_get_index:_network__stub__" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) touch "$(xnu_src)/.$@__5"; \
+	fi
+	@echo "[FIXUP] xcpm..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__6" ]; then \
+		$(HELP) echo "uint32_t xcpm_bios_mbox_cmd_read(uint32_t a); static uint32_t __xcpm_reg[64] = {};" >> "$(xnu_src)/osfmk/x86_64/loose_ends.c"; \
+		$(HELP) echo "uint32_t xcpm_bios_mbox_cmd_read(uint32_t a) { return __xcpm_reg[a%64]; }" >> "$(xnu_src)/osfmk/x86_64/loose_ends.c"; \
+		$(HELP) echo "void xcpm_bios_mbox_cmd_write(uint32_t a, uint32_t b);" >> "$(xnu_src)/osfmk/x86_64/loose_ends.c"; \
+		$(HELP) echo "void xcpm_bios_mbox_cmd_write(uint32_t a, uint32_t b) { __xcpm_reg[a%64] = b; }" >> "$(xnu_src)/osfmk/x86_64/loose_ends.c"; \
+		$(HELP) echo "boolean_t xcpm_is_hwp_enabled(void);" >> "$(xnu_src)/osfmk/x86_64/loose_ends.c"; \
+		$(HELP) echo "boolean_t xcpm_is_hwp_enabled(void) { return 0; }" >> "$(xnu_src)/osfmk/x86_64/loose_ends.c"; \
+		$(HELP) echo "void xcpm_mbox_lock(void);" >> "$(xnu_src)/osfmk/x86_64/loose_ends.c"; \
+		$(HELP) echo "void xcpm_mbox_lock(void) {}" >> "$(xnu_src)/osfmk/x86_64/loose_ends.c"; \
+		$(HELP) echo "_xcpm_bios_mbox_cmd_read" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_xcpm_bios_mbox_cmd_unsafe_read:_xcpm_bios_mbox_cmd_read" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_xcpm_bios_mbox_cmd_write" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_xcpm_is_hwp_enabled" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_xcpm_mbox_lock" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_xcpm_mbox_unlock:_xcpm_mbox_lock" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) touch "$(xnu_src)/.$@__6"; \
+	fi
+	@echo "[FIXUP] pmap..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__7" ]; then \
+		$(HELP) echo "bool pmap_is_trust_cache_loaded(void);" >> "$(xnu_src)/osfmk/x86_64/pmap.c"; \
+		$(HELP) echo "bool pmap_is_trust_cache_loaded(void) { return false; }" >> "$(xnu_src)/osfmk/x86_64/pmap.c"; \
+		$(HELP) echo "int pmap_load_image4_trust_cache(void);" >> "$(xnu_src)/osfmk/x86_64/pmap.c"; \
+		$(HELP) echo "int pmap_load_image4_trust_cache(void) { return -1; }" >> "$(xnu_src)/osfmk/x86_64/pmap.c"; \
+		$(HELP) echo "kern_return_t pmap_load_legacy_trust_cache(void);" >> "$(xnu_src)/osfmk/x86_64/pmap.c"; \
+		$(HELP) echo "kern_return_t pmap_load_legacy_trust_cache(void) { return KERN_NOT_SUPPORTED; }" >> "$(xnu_src)/osfmk/x86_64/pmap.c"; \
+		$(HELP) echo "_pmap_is_trust_cache_loaded" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_pmap_load_image4_trust_cache" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_pmap_load_legacy_trust_cache" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_pmap_lookup_in_loaded_trust_cache:_pmap_is_trust_cache_loaded" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) echo "_pmap_lookup_in_static_trust_cache:_pmap_is_trust_cache_loaded" >> "$(xnu_src)/config/Private.exports"; \
+		$(HELP) touch "$(xnu_src)/.$@__7"; \
+	fi
+	@echo "[FIXUP] done."
+
+.SECONDEXPANSION:
+xnu-fixups-10.15: $$(xnu_src)/.src
+
+xnu-fixups-10.15:
+	@echo "[FIXUP] cpuid.c ..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__1" ]; then \
+		$(HELP) sed -i -e 's/outl(cfgAdr, XeonCapID5);//; s/uint32_t cap5reg = inl(cfgDat);/uint32_t cap5reg = 0;/' $(xnu_src)/osfmk/i386/cpuid.h; \
+		$(HELP) touch "$(xnu_src)/.$@__1"; \
+	fi
+	@echo "[FIXUP] squashing Werror warnings ..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__2" ]; then \
+		$(HELP) awk '/^subr_prof.o_CFLAGS/ { print "nfs_subs.o_CFLAGS_ADD += -Wno-unused-parameter"; print "nfs_vfsops.o_CFLAGS_ADD += -Wno-unused-parameter -Wno-unused-variable"; print "nfs_vnops.o_CFLAGS_ADD += -Wno-unused-function"; print "if_ipsec.o_CFLAGS_ADD += -Wno-unused-function"; } { print $0 }' $(xnu_src)/bsd/conf/Makefile.template > $(xnu_src)/.__tmp__ && mv $(xnu_src)/.__tmp__ $(xnu_src)/bsd/conf/Makefile.template; \
+		$(HELP) touch "$(xnu_src)/.$@__2"; \
+	fi
+	@echo "[FIXUP] networking ..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__3" ]; then \
+		$(HELP) sed -i -e 's/^notsup:$$//' $(xnu_src)/bsd/nfs/nfs_node.c; \
+		$(HELP) awk '/include <net\/if_utun.h>/ { print "#include <net/if_vlan_var.h>"; } { print $0 }' $(xnu_src)/bsd/net/dlil.c > $(xnu_src)/.__tmp__ && mv $(xnu_src)/.__tmp__ $(xnu_src)/bsd/net/dlil.c; \
+		$(HELP) sed -i -e 's/\(if_headless_init.*\)/\1;void \1/' $(xnu_src)/bsd/net/if_headless.c; \
+		$(HELP) sed -i -e '/if (pcb->ipsec_kpipe_count == 0.*/{N;N;N;N;d;}' $(xnu_src)/bsd/net/if_ipsec.c; \
+		$(HELP) touch "$(xnu_src)/.$@__3"; \
+	fi
+	@echo "[FIXUP] export lists ..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__exp" ]; then \
+		$(HELP) echo "_pmap_in_ppl\n_pmap_free_reserved_ppl_page\n_pmap_claim_reserved_ppl_page" >> $(xnu_src)/config/Private.exports; \
+		$(HELP) touch "$(xnu_src)/.$@__exp"; \
+	fi
+
+.SECONDEXPANSION:
+xnu-fixups-10.15.3: $$(xnu_src)/.src
+
+xnu-fixups-10.15.3: xnu-fixups-10.15
+	@echo "[FIXUP] networking (10.15.3) ..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__4" ]; then \
+		$(HELP) sed -i -e '/nfs4_delegreturn_rpc(.*/{N;d;}' $(xnu_src)/bsd/nfs/nfs_node.c; \
+		$(HELP) touch "$(xnu_src)/.$@__4"; \
+	fi
+	@echo "[FIXUP] dtrace link error ..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__5" ]; then \
+		$(HELP) sed -i -e '1{x;p;x;}' osfmk/vm/vm_fault.c; \
+		$(HELP) touch "$(xnu_src)/.$@__5"; \
+	fi
+
+.SECONDEXPANSION:
+xnu-fixups-10.15.4: $$(xnu_src)/.src
+
+xnu-fixups-10.15.4: xnu-fixups-10.15
+	@echo "[FIXUP] networking (10.15.3) ..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__6" ]; then \
+		$(HELP) sed -i -e '/nfs4_delegreturn_rpc(.*/{N;d;}' $(xnu_src)/bsd/nfs/nfs_node.c; \
+		$(HELP) touch "$(xnu_src)/.$@__6"; \
+	fi
+	@echo "[FIXUP] networking (10.15.4) ..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__7" ]; then \
+		$(HELP) awk '/include <net\/net_api_stats.h>/ { print "#include <net/pfvar.h>"; } { print $0 }' $(xnu_src)/bsd/net/if_bridge.c  > $(xnu_src)/.__tmp__ && mv $(xnu_src)/.__tmp__ $(xnu_src)/bsd/net/if_bridge.c; \
+		$(HELP) touch "$(xnu_src)/.$@__7"; \
+	fi
+
+.SECONDEXPANSION:
+xnu-fixups-10.15.6: $$(xnu_src)/.src
+
+xnu-fixups-10.15.6: xnu-fixups-10.15.4
+	@echo "[FIXUP] unused variable ..."
+	@$(HELP) if [ ! -f "$(xnu_src)/.$@__8" ]; then \
+		$(HELP) sed -i -e '/cwa_classifier_e wa_reqd;/d' $(xnu_src)/osfmk/i386/cpuid.c; \
+		awk '/IOPMrootDomain.cpo_CXX/{ print "IODMACommand.iig.cpo_CXXWARNFLAGS_ADD += -Wno-duplicate-decl-specifier"; } { print $0 }' $(xnu_src)/iokit/conf/Makefile.template > $(xnu_src)/.__tmp__ && mv $(xnu_src)/.__tmp__ $(xnu_src)/iokit/conf/Makefile.template; \
+		$(HELP) touch "$(xnu_src)/.$@__8"; \
+	fi
+
+ifeq ($(findstring 11.,$(macos_version)),11.)
+Libsystem: ARCHS = x86_64 arm64
+libsyscall: ARCHS = x86_64 arm64
+else
+Libsystem: ARCHS = x86_64 i386
+libsyscall: ARCHS = x86_64 i386
+endif
+
+Libsystem:
+	@$(HELP) mkdir -p $(SRCDIR)/dst $(SRCDIR)/obj $(SRCDIR)/sym
+	@$(HELP) cd $(SRCDIR) && $(HELP) xcodebuild installhdrs -sdk macosx ARCHS='$(ARCHS)' VALID_ARCHS='$(ARCHS)' SRCROOT="$(SRCDIR)" OBJROOT="$(SRCDIR)/obj" DSTROOT="$(SRCDIR)/dst"
+	$(HELP) sudo ditto "$(SRCDIR)/dst" "$(SDKPATH)"
+
+libsyscall: BUILDDIR=$(xnu_path)/BUILD.libsyscall
+libsyscall: dtrace AvailabilityVersions libdispatch Libsystem
+	# install XNU and Libsyscall headers
+	@$(HELP) mkdir -p "$(xnu_path)/BUILD.hdrs/dst" "$(xnu_path)/BUILD.hdrs/obj" "$(xnu_path)/BUILD.hdrs/sym"
+	@$(HELP) cd "$(xnu_path)" && $(HELP) make installhdrs XNU_LOGCOLORS=y SDKROOT=macosx ARCH_CONFIGS=X86_64 SRCROOT="$(xnu_path)" OBJROOT="$(xnu_path)/BUILD.hdrs/obj" SYMROOT="$(xnu_path)/BUILD.hdrs/sym" DSTROOT="$(xnu_path)/BUILD.hdrs/dst"
+ifeq ($(findstring 10.14.1,$(macos_version)),10.14.1)
+	# There are a few missing bits in libsyscall :-(
+	@$(HELP) touch "$(xnu_path)/libsyscall/os/thread_self_restrict.h"
+	@$(HELP) mkdir -p "$(xnu_path)/libsyscall/wrappers/skywalk"
+	@$(HELP) touch "$(xnu_path)/libsyscall/wrappers/skywalk/os_packet.c"
+	@$(HELP) touch "$(xnu_path)/libsyscall/wrappers/skywalk/os_channel.c"
+	@$(HELP) touch "$(xnu_path)/libsyscall/wrappers/skywalk/os_nexus.c"
+	@$(HELP) touch "$(xnu_path)/libsyscall/wrappers/skywalk/cpu_in_cksum_gen.c"
+	@$(HELP) touch "$(xnu_path)/libsyscall/wrappers/skywalk/cpu_copy_in_cksum_gen.c"
+	@$(HELP) touch "$(xnu_path)/libsyscall/wrappers/skywalk/cpu_in_cksum.s"
+	@$(HELP) touch "$(xnu_path)/libsyscall/wrappers/skywalk/cpu_copy_in_cksum.s"
+	@$(HELP) sed -iE 's/ -lCrashReporterClient//' "$(xnu_path)/libsyscall/Libsyscall.xcconfig"
+endif
+	@$(HELP) cd "$(xnu_path)" && $(HELP) make installhdrs XNU_LOGCOLORS=y RC_ProjectName=Libsyscall SDKROOT=macosx RC_ARCHS='$(ARCHS)' VALID_ARCHS='$(ARCHS)' OBJROOT="$(xnu_path)/BUILD.hdrs/obj" SYMROOT="$(xnu_path)/BUILD.hdrs/sym" DSTROOT="$(xnu_path)/BUILD.hdrs/dst"
+	$(HELP) sudo ditto "$(xnu_path)/BUILD.hdrs/dst" "$(SDKPATH)"
+	# Build Libsyscall
+	@$(HELP) mkdir -p "$(BUILDDIR)/dst" "$(BUILDDIR)/obj" "$(BUILDDIR)/sym"
+	@$(HELP) cd "$(xnu_path)" && $(HELP) make install XNU_LOGCOLORS=y RC_ProjectName=Libsyscall RC_ARCHS='x86_64 i386' SDKROOT=macosx OBJROOT="$(BUILDDIR)/obj" SYMROOT="$(BUILDDIR)/sym" DSTROOT="$(BUILDDIR)/dst"
+
+help-libsyscall: HELP=echo CMD:
+help-libsyscall: libsyscall
+
+.SECONDEXPANSION:
+libsyscall: $$(xnu_src)/.src
+
+libsyscall_install: libsyscall
+	$(HELP) sudo ditto "$(xnu_src)/BUILD.libsyscall/dst/usr/lib/system" "/usr/lib/system"
+	$(HELP) sudo update_dyld_shared_cache
+	@echo
+	@echo "A new libsyscall has been installed in: /usr/lib/system"
+	@echo "You must reboot for this change to take effect."
+	@echo
+
+help-libsyscall_install: HELP=echo CMD:
+help-libsyscall_install: libsyscall
+
+# --------------------------------------------------
+#
+# Below this point are macros which download, and
+# extract source. The URLs from which the source is
+# downloaded is calculated by scraping the Apple
+# opensource website for the specified macos_version
+# (see RELEASE_URL definition).
+#
+# --------------------------------------------------
+
+download:
+	@echo "All source downloaded"
+
+
+define download_tarball
+$(1)_version ?= $$(shell curl -s $$(RELEASE_URL) | grep "$(1)" | grep tarballs/ | sed "s/.*\/$(1)-\(.*\).tar.gz\".*/\1/")
+$(1)_tarball := $(1)-$$($(1)_version).tar.gz
+$(1)_tarball_url := $$(TARBALL_URL)/$(1)/$(1)-$$($(1)_version).tar.gz
+$(1)_src := $(1)-$$($(1)_version)
+$(1)_path := $$(shell pwd)/$(1)-$$($(1)_version)
+$(1)_ver_err := Couldn't determine version of $(1) ($$($(1)_version)) from $$(RELEASE_URL). Are you connected to the Internet?
+#$(1)-$$($(1)_version).tar.gz:
+$$($(1)_tarball):
+	@echo "Downloading $(1) v$$($(1)_version)..."
+	@if [ -z "$$($(1)_version)" ]; then $(MAKE) -f $(lastword $(MAKEFILE_LIST)) ERROR="$$($(1)_ver_err)" err; fi
+	@$$(HELP) curl -O $$($(1)_tarball_url)
+$$($(1)_src)/.src: $$($(1)_tarball)
+	@echo "Unpacking $(1)..."
+	@$$(HELP) tar zxf $$<
+	@$$(HELP) touch $$@
+$(1): $$($(1)_src)/.src
+$(1): SRCDIR=$$($(1)_path)
+.PHONY: clean-$(1) $$($(1)_vers)
+clean-$(1):
+	rm -rf $$($(1)_src)
+	rm -f $$($(1)_tarball)
+help-$(1): HELP=echo CMD:
+help-$(1): $(1)
+	echo
+download: $$($(1)_src)/.src
+download-$(1): $$($(1)_tarball)
+ver-$(1):
+	@if [ -z "$$($(1)_version)" ]; then $(MAKE) -f $(lastword $(MAKEFILE_LIST)) ERROR="$$($(1)_ver_err)" err; fi
+	@echo "$(1)-$$($(1)_version) : $$($(1)_tarball_url)"
+endef
+
+$(foreach pkg,$(PKGS),$(eval $(call download_tarball,$(pkg))))
+
+getvers: $(foreach pkg,$(PKGS),ver-$(pkg))
+	@echo "macOS: $(macos_version)"
+
+err:
+	$(error $(ERROR))
+
+clean: $(foreach pkg,$(PKGS),clean-$(pkg))
+
+help: check_tools
+	@echo "Available targets:"
+	@echo "    xnudeps"
+	@echo "    download"
+	@echo "    clean"
+	@echo "    $(PKGS) libsyscall libsyscall_install"
+	@echo "    $(PKGS:%=help-%) help-libsyscall help-libsyscall_install"
+	@echo
+	@echo "default: xnudeps"
+	@echo
+	@echo "Use the macos_version variable to set the version of "
+	@echo "macOS for which you would like to compile, e.g."
+	@echo
+	@echo "default: macos_version=$(macos_version)"
+	@echo
+	@echo "TOOLCHAIN_PATH: $(TOOLCHAIN_PATH)"
+	@echo "SDKPATH: $(SDKPATH)"
+	@echo "XCODEPATH: $(XCODEPATH)"
+
+.PHONY: err getvers help clean check_tools
